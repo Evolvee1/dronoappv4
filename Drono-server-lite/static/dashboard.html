@@ -623,6 +623,61 @@
         #manualUpdateBtn:hover {
             background-color: #45a049;
         }
+
+        /* SMS actions styling */
+        .sms-actions {
+            padding: 16px;
+            border-top: 1px solid #e0e0e0;
+            margin-top: 15px;
+        }
+        
+        .sms-actions h4 {
+            margin-top: 0;
+            margin-bottom: 15px;
+            font-size: 14px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        .sms-form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        
+        .sms-form input {
+            padding: 8px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 13px;
+            width: 100%;
+        }
+        
+        .sms-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 5px;
+        }
+        
+        .btn-sms {
+            background-color: #4caf50;
+            flex: 1;
+        }
+        
+        .btn-sms:hover {
+            background-color: #388e3c;
+        }
+        
+        .btn-renew {
+            background-color: #ff9800;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        
+        .btn-renew:hover {
+            background-color: #f57c00;
+        }
     </style>
 </head>
 <body>
@@ -975,8 +1030,19 @@
                                 </div>
                                 <div class="stat-item url">
                                     <div class="stat-label">URL</div>
-                                    <div class="stat-value">Loading...</div>
+                                    <div class="stat-value">-</div>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="sms-actions">
+                        <h4>SMS Actions</h4>
+                        <button class="btn btn-renew" onclick="sendDataRenewalSMS('${device.id}')">Open Messages & Send "DN" to 950</button>
+                        <div class="sms-form">
+                            <input type="tel" placeholder="Phone number" class="sms-number" id="sms-number-${device.id}">
+                            <input type="text" placeholder="Message" class="sms-message" id="sms-message-${device.id}">
+                            <div class="sms-buttons">
+                                <button class="btn btn-sms" onclick="sendCustomSMS('${device.id}')">Open Messages & Send</button>
                             </div>
                         </div>
                     </div>
@@ -1956,6 +2022,68 @@
         $('#manualUpdateBtn').click(function() {
             requestSelectedDeviceStatuses();
         });
+
+        // Add SMS functions
+        async function sendDataRenewalSMS(deviceId) {
+            try {
+                showToast(`Sending data renewal SMS from device ${deviceId}...`, 'info');
+                
+                const response = await fetch(`/devices/${deviceId}/renew-data`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    showToast(`Data renewal SMS sent successfully`, 'success');
+                } else {
+                    showToast(`Error: ${result.detail || 'Failed to send data renewal SMS'}`, 'error');
+                }
+            } catch (error) {
+                console.error('Error sending data renewal SMS:', error);
+                showToast(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        async function sendCustomSMS(deviceId) {
+            try {
+                const phoneNumber = document.getElementById(`sms-number-${deviceId}`).value.trim();
+                const message = document.getElementById(`sms-message-${deviceId}`).value.trim();
+                
+                if (!phoneNumber || !message) {
+                    showToast('Please enter both phone number and message', 'error');
+                    return;
+                }
+                
+                showToast(`Sending SMS to ${phoneNumber} from device ${deviceId}...`, 'info');
+                
+                const response = await fetch(`/devices/${deviceId}/send-sms`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        device_id: deviceId,
+                        phone_number: phoneNumber,
+                        message: message
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    showToast(`SMS sent successfully to ${phoneNumber}`, 'success');
+                } else {
+                    showToast(`Error: ${result.detail || 'Failed to send SMS'}`, 'error');
+                }
+            } catch (error) {
+                console.error('Error sending SMS:', error);
+                showToast(`Error: ${error.message}`, 'error');
+            }
+        }
     </script>
 </body>
 </html> 

@@ -91,6 +91,12 @@ class URLDistributionRequest(BaseModel):
     delay_min: int = 1
     delay_max: int = 2
 
+# Add new model for SMS requests
+class SMSRequest(BaseModel):
+    device_id: str
+    phone_number: str
+    message: str
+
 # Add new model for logging control
 class LoggingConfigRequest(BaseModel):
     level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -796,6 +802,108 @@ async def get_logging_status():
     except Exception as e:
         logger.error(f"Failed to get logging status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Add endpoint for sending SMS
+@app.post("/devices/{device_id}/send-sms")
+async def send_sms(device_id: str, sms_request: SMSRequest, use_ui: bool = True):
+    """Send an SMS message from a device"""
+    # Validate device_id in path matches the one in the request
+    if device_id != sms_request.device_id:
+        raise HTTPException(status_code=400, detail="Device ID in path must match device ID in request body")
+    
+    # Check if device exists
+    devices = adb_controller.get_devices()
+    device_ids = [d['id'] for d in devices]
+    
+    if device_id not in device_ids:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+    
+    # Send the SMS using the appropriate method
+    if use_ui:
+        result = await adb_controller.send_sms_via_ui(
+            device_id=device_id,
+            phone_number=sms_request.phone_number,
+            message=sms_request.message
+        )
+    else:
+        result = await adb_controller.send_sms(
+            device_id=device_id,
+            phone_number=sms_request.phone_number,
+            message=sms_request.message
+        )
+    
+    if not result.get("success", False):
+        # Return a 500 error with the error message
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send SMS: {result.get('error', 'Unknown error')}"
+        )
+    
+    # Broadcast the SMS status to connected clients
+    await connection_manager.broadcast_all({
+        "type": "sms_sent",
+        "data": {
+            "device_id": device_id,
+            "phone_number": sms_request.phone_number,
+            "message": sms_request.message,
+            "timestamp": datetime.now().isoformat()
+        }
+    })
+    
+    return {
+        "status": "success",
+        "message": f"SMS sent to {sms_request.phone_number}",
+        "details": result
+    }
+
+# Add endpoint for quick data renewal SMS
+@app.post("/devices/{device_id}/renew-data")
+async def renew_data(device_id: str, message: str = "DN", phone_number: str = "950", use_ui: bool = True):
+    """Send a data renewal SMS (default: 'DN' to '950')"""
+    # Check if device exists
+    devices = adb_controller.get_devices()
+    device_ids = [d['id'] for d in devices]
+    
+    if device_id not in device_ids:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+    
+    # Send the SMS using the appropriate method
+    if use_ui:
+        result = await adb_controller.renew_data_via_ui(
+            device_id=device_id,
+            phone_number=phone_number,
+            message=message
+        )
+    else:
+        result = await adb_controller.send_sms(
+            device_id=device_id,
+            phone_number=phone_number,
+            message=message
+        )
+    
+    if not result.get("success", False):
+        # Return a 500 error with the error message
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send data renewal SMS: {result.get('error', 'Unknown error')}"
+        )
+    
+    # Broadcast the SMS status to connected clients
+    await connection_manager.broadcast_all({
+        "type": "data_renewal",
+        "data": {
+            "device_id": device_id,
+            "phone_number": phone_number,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        }
+    })
+    
+    return {
+        "status": "success",
+        "message": f"Data renewal SMS sent to {phone_number}",
+        "details": result
+    }
 
 if __name__ == "__main__":
     import uvicorn

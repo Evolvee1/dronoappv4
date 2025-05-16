@@ -46,9 +46,9 @@ class AdbController:
     
     def _escape_shell_string(self, text: str) -> str:
         """Escape a string for shell command usage"""
-        # First escape single quotes (replace ' with \')
-        escaped = text.replace("'", "\\'")
-        return f"'{escaped}'"
+        if not text:
+            return ""
+        return text.replace("&", "\\&").replace("?", "\\?").replace(" ", "\\ ").replace("'", "\\'").replace('"', '\\"')
     
     def _escape_xml_string(self, text: str) -> str:
         """Escape a string for XML content"""
@@ -245,9 +245,9 @@ class AdbController:
             return False
 
     def distribute_url(self, device_ids: List[str], url: str, iterations: int = 100,
-                      min_interval: int = 1, max_interval: int = 2,
-                      use_webview: bool = True, rotate_ip: bool = True,
-                      delay_min: int = 0, delay_max: int = 0) -> Dict[str, Dict]:
+                       min_interval: int = 1, max_interval: int = 2,
+                       use_webview: bool = True, rotate_ip: bool = True,
+                       delay_min: int = 0, delay_max: int = 0) -> Dict[str, Dict]:
         """
         Distribute a URL to multiple devices
         
@@ -275,111 +275,147 @@ class AdbController:
         results = {}
         
         for device_id in device_ids:
-            # Step 1: Force stop the app
+            logger.info(f"Distributing URL {url} to device {device_id}")
+            success = False
+            
+            # First, kill the app to ensure a clean start
             logger.info(f"Force stopping app on device {device_id}")
             try:
-                subprocess.run(
-                    ['adb', '-s', device_id, 'shell', f"am force-stop {self.package}"],
-                    capture_output=True,
-                    check=True
-                )
-                # Wait for app to fully stop
-                time.sleep(2)
+                subprocess.run(['adb', '-s', device_id, 'shell', f"am force-stop {self.package}"], capture_output=True)
+                # Wait a moment for the app to fully stop
+                time.sleep(1)
             except Exception as e:
-                logger.error(f"Failed to stop app on device {device_id}: {e}")
+                logger.error(f"Error force-stopping app: {e}")
             
-            # Step 2: Apply settings using ROOT MODE
-            settings_applied = self._apply_settings_root_method(
-                device_id, url, iterations, min_interval, max_interval, use_webview, rotate_ip, delay_min, delay_max
-            )
+            # Try the direct auto_start method first, which worked in manual testing
+            logger.info(f"Trying direct auto_start method for device {device_id}")
             
-            # Step 3: Start app and apply settings via intents (as backup)
+            # Escape URL for command line safety
+            escaped_url = self._escape_shell_string(url)
+            
+            auto_start_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f"am start -n {self.package}/{self.activity}" +
+                f" --es custom_url {escaped_url}" +
+                f" --ei iterations {iterations}" +
+                f" --ei min_interval {min_interval}" +
+                f" --ei max_interval {max_interval}" +
+                f" --ei delay_min {delay_min}" +
+                f" --ei delay_max {delay_max}" +
+                f" --ez auto_start true"
+            ]
+            
             try:
-                # Try multiple approaches to ensure settings are applied
-                escaped_url = self._escape_shell_string(url)
+                result = subprocess.run(auto_start_cmd, capture_output=True, text=True)
+                logger.info(f"Auto start result: {result.stdout}")
+                if "Starting" in result.stdout:
+                    logger.info(f"Auto start command sent successfully to device {device_id}")
+                    success = True
+                    results[device_id] = {
+                        "success": True,
+                        "settings_method": "auto_start",
+                        "message": "Started with auto_start flag",
+                        "url": url,
+                        "iterations": iterations,
+                        "min_interval": min_interval,
+                        "max_interval": max_interval,
+                        "delay_min": delay_min,
+                        "delay_max": delay_max
+                    }
+                    continue
+            except Exception as e:
+                logger.error(f"Error sending auto start command: {e}")
+            
+            # If auto_start didn't work, continue with the regular approach
+            try:
+                escaped_url = url.replace("&", "\\&").replace("?", "\\?")
                 
-                # Method 1: Start with intent including all parameters
-                logger.info(f"Starting app on device {device_id} with custom_url intent")
+                # Step 1: Force stop the app
+                logger.info(f"Force stopping app on device {device_id}")
+                subprocess.run(['adb', '-s', device_id, 'shell', f"am force-stop {self.package}"], capture_output=True)
+                
+                # Step 2: Apply settings using ROOT MODE
+                settings_applied = self._apply_settings_root_method(
+                    device_id, url, iterations, min_interval, max_interval, use_webview, rotate_ip, delay_min, delay_max
+                )
+                
+                if not settings_applied:
+                    logger.warning(f"Failed to apply settings using ROOT method for device {device_id}")
+                    
+                # Step 3: Start the app with ACTION_START_SIMULATION intent including all parameters
+                logger.info(f"Starting app on device {device_id} with ACTION_START_SIMULATION intent")
                 start_cmd = [
-                    'adb', '-s', device_id, 'shell', 
-                    f"am start -n {self.package}/{self.activity} --es custom_url {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} --ez load_from_intent true"
+                    'adb', '-s', device_id, 'shell',
+                    f"am start -a com.example.imtbf.START_SIMULATION -n {self.package}/{self.activity} --es custom_url {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} --ez load_images {str(use_webview).lower()} --ez javascript true --ez cookies true --ez dom_storage true"
                 ]
                 
                 subprocess.run(start_cmd, capture_output=True, text=True)
+                # Wait for app to fully start by polling for the process
+                logger.info(f"Waiting for app process to start on device {device_id}")
+                process_started = False
+                process_id = ""
+                for _ in range(20):  # 20 * 0.5s = 10 seconds max
+                    process_id = subprocess.run(
+                        ['adb', '-s', device_id, 'shell', f"pidof {self.package}"],
+                        capture_output=True,
+                        text=True
+                    ).stdout.strip()
+                    
+                    if process_id:
+                        process_started = True
+                        logger.info(f"App process started on device {device_id} with PID {process_id}")
+                        # Add a longer delay here to ensure the app is fully initialized
+                        logger.info(f"Waiting 5 seconds for app to fully initialize on device {device_id}")
+                        time.sleep(5)
+                        break
+                    time.sleep(0.5)
                 
-                # Wait for app to fully start
-                time.sleep(2)
+                if not process_started:
+                    logger.warning(f"App process did not start on device {device_id} within timeout")
+                    results[device_id] = {
+                        "success": False,
+                        "message": "App process did not start within timeout",
+                        "url": url
+                    }
+                    continue
                 
-                # Method 2: Send additional broadcasts to ensure settings are applied
-                logger.info(f"Sending broadcast intents to device {device_id}")
-                
-                # Command broadcast for URL
-                subprocess.run([
-                    'adb', '-s', device_id, 'shell',
-                    f"am broadcast -a {self.package}.COMMAND --es command set_url --es value {escaped_url} -p {self.package}"
-                ], capture_output=True)
-                
-                # SET_URL action broadcast
-                subprocess.run([
-                    'adb', '-s', device_id, 'shell',
-                    f"am broadcast -a {self.package}.SET_URL --es url {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} -p {self.package}"
-                ], capture_output=True)
-                
-                # Method 3: Try deep linking (useful for some devices)
-                import urllib.parse
-                encoded_url_for_deep_link = urllib.parse.quote(url)
-                
-                subprocess.run([
-                    'adb', '-s', device_id, 'shell',
-                    f"am start -n {self.package}/{self.activity} -a android.intent.action.VIEW -d 'traffic-sim://load_url?url={encoded_url_for_deep_link}&iterations={iterations}&min_interval={min_interval}&max_interval={max_interval}&delay_min={delay_min}&delay_max={delay_max}&force=true'"
-                ], capture_output=True)
-                
-                # Wait a moment for intents to process
+                # Add additional delay before sending start command
                 time.sleep(1)
                 
-                # Step 4: Send start command
-                logger.info(f"Starting simulation on device {device_id}")
-                start_result = subprocess.run([
+                # First, try using the direct broadcast command that worked in manual testing
+                logger.info(f"Sending direct start broadcast command to device {device_id}")
+                direct_start_cmd = [
                     'adb', '-s', device_id, 'shell',
-                    f"am broadcast -a {self.package}.COMMAND --es command start -p {self.package}"
-                ], capture_output=True)
+                    f"am broadcast -a com.example.imtbf.debug.COMMAND --es command start -p {self.package}"
+                ]
                 
-                # Verify app is running
-                process_id = subprocess.run(
-                    ['adb', '-s', device_id, 'shell', f"pidof {self.package}"],
-                    capture_output=True,
-                    text=True
-                ).stdout.strip()
-                
-                # Check settings after start (helpful debugging)
-                current_url = "unknown"
                 try:
-                    # Check settings using root
-                    prefs_check = subprocess.run(['adb', '-s', device_id, 'shell', 
-                                               f"su -c 'cat {self.prefs_file}'"], 
-                                              capture_output=True, text=True).stdout
+                    broadcast_result = subprocess.run(direct_start_cmd, capture_output=True, text=True)
+                    logger.info(f"Direct start broadcast result: {broadcast_result.stdout}")
+                    if "Broadcast completed" in broadcast_result.stdout:
+                        logger.info(f"Direct start broadcast command sent successfully to device {device_id}")
+                        success = True
+                    else:
+                        # Continue with other methods if direct broadcast didn't work
+                        logger.info(f"Sending broadcast intents to device {device_id}")
                         
-                    if 'target_url' in prefs_check:
-                        import re
-                        match = re.search(r'<string name="target_url">(.*?)</string>', prefs_check)
-                        if match:
-                            current_url = match.group(1)
-                except Exception:
-                    pass
-                
-                # For safety, send a final settings update command
-                time.sleep(2)
-                subprocess.run([
-                    'adb', '-s', device_id, 'shell',
-                    f"am broadcast -a {self.package}.COMMAND --es command reload_url --es value {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} -p {self.package}"
-                ], capture_output=True)
+                        # Method 2: Send additional broadcasts to ensure settings are applied
+                        self._send_broadcast_commands(device_id, url, iterations, min_interval, max_interval, delay_min, delay_max)
+                        
+                        # Method 3: Try to start the activity directly with custom URL
+                        self._start_activity_with_url(device_id, url, iterations, min_interval, max_interval, delay_min, delay_max)
+                        
+                        # Get current URL if possible
+                        current_url = self._get_current_url(device_id)
+                except Exception as e:
+                    logger.error(f"Error sending direct start broadcast: {e}")
                 
                 results[device_id] = {
-                    "success": len(process_id) > 0,
+                    "success": process_started,
                     "settings_method": "root",
                     "message": f"App is running with PID: {process_id}" if process_id else "Failed to start app",
                     "url": url,
-                    "current_url": current_url,
+                    "current_url": current_url if 'current_url' in locals() else "",
                     "iterations": iterations,
                     "min_interval": min_interval,
                     "max_interval": max_interval,
@@ -427,14 +463,7 @@ class AdbController:
                 use_webview, rotate_ip, delay_min, delay_max
             )
             
-            # Convert to expected format
-            device_result = result.get(device_id, {})
-            return {
-                "success": device_result.get("success", False),
-                "command": command,
-                "device_id": device_id,
-                "result": device_result
-            }
+            return result
                 
         elif command == "stop":
             # Stop app
@@ -916,6 +945,579 @@ class AdbController:
         except Exception as e:
             logger.error(f"Failed to get detailed timing information: {e}")
             return timing_info
+
+    def _send_broadcast_commands(self, device_id, url, iterations, min_interval, max_interval, delay_min, delay_max):
+        """Send broadcast commands to configure the app"""
+        # First, ensure the app is stopped
+        try:
+            logger.info(f"Force stopping app before sending broadcasts on device {device_id}")
+            subprocess.run(['adb', '-s', device_id, 'shell', f"am force-stop {self.package}"], capture_output=True)
+            # Wait a moment for the app to fully stop
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Error force-stopping app: {e}")
+            
+        # Start the app
+        try:
+            logger.info(f"Starting app on device {device_id}")
+            subprocess.run(['adb', '-s', device_id, 'shell', f"am start -n {self.package}/{self.activity}"], capture_output=True)
+            # Wait a moment for the app to fully start
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"Error starting app: {e}")
+            
+        escaped_url = self._escape_shell_string(url)
+        
+        # Command broadcast for URL
+        subprocess.run([
+            'adb', '-s', device_id, 'shell',
+            f"am broadcast -a {self.package}.COMMAND --es command set_url --es value {escaped_url} -p {self.package}"
+        ], capture_output=True)
+        
+        # SET_URL action broadcast
+        subprocess.run([
+            'adb', '-s', device_id, 'shell',
+            f"am broadcast -a {self.package}.SET_URL --es url {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} -p {self.package}"
+        ], capture_output=True)
+        
+        # Send start command
+        logger.info(f"Starting simulation on device {device_id}")
+        start_result = subprocess.run([
+            'adb', '-s', device_id, 'shell',
+            f"am broadcast -a {self.package}.COMMAND --es command start -p {self.package}"
+        ], capture_output=True)
+        
+        # For safety, send a final settings update command
+        time.sleep(2)
+        subprocess.run([
+            'adb', '-s', device_id, 'shell',
+            f"am broadcast -a {self.package}.COMMAND --es command reload_url --es value {escaped_url} --ei iterations {iterations} --ei min_interval {min_interval} --ei max_interval {max_interval} --ei delay_min {delay_min} --ei delay_max {delay_max} -p {self.package}"
+        ], capture_output=True)
+    
+    def _start_activity_with_url(self, device_id, url, iterations, min_interval, max_interval, delay_min, delay_max):
+        """Start the activity with the URL and parameters"""
+        logger.info(f"Starting activity on device {device_id} with URL {url} and auto_start flag")
+        
+        # First, ensure the app is stopped
+        try:
+            logger.info(f"Force stopping app before starting on device {device_id}")
+            subprocess.run(['adb', '-s', device_id, 'shell', f"am force-stop {self.package}"], capture_output=True)
+            # Wait a moment for the app to fully stop
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Error force-stopping app: {e}")
+        
+        # Escape URL for command line safety
+        escaped_url = self._escape_shell_string(url)
+        
+        # Build complete command with all parameters including auto_start flag
+        start_cmd = [
+            'adb', '-s', device_id, 'shell',
+            f"am start -n {self.package}/{self.activity}" +
+            f" --es custom_url {escaped_url}" +
+            f" --ei iterations {iterations}" +
+            f" --ei min_interval {min_interval}" +
+            f" --ei max_interval {max_interval}" +
+            f" --ei delay_min {delay_min}" +
+            f" --ei delay_max {delay_max}" +
+            f" --ez auto_start true"
+        ]
+        
+        # Execute the command with full error handling
+        try:
+            result = subprocess.run(start_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Error starting activity on device {device_id}. Error: {result.stderr}")
+                return False
+            
+            # Check output for warnings
+            if "Warning" in result.stdout or "Error" in result.stdout:
+                logger.warning(f"Warning when starting activity: {result.stdout}")
+            
+            logger.info(f"Activity started successfully on device {device_id}")
+            
+            # Wait 5 seconds to give the app time to start
+            time.sleep(5)
+            return True
+        except Exception as e:
+            logger.error(f"Exception when starting activity: {str(e)}")
+            return False
+    
+    def _get_current_url(self, device_id):
+        """Get the current URL from the app's preferences"""
+        current_url = "unknown"
+        try:
+            # Check settings using root
+            prefs_check = subprocess.run(['adb', '-s', device_id, 'shell', 
+                                       f"su -c 'cat {self.prefs_file}'"], 
+                                      capture_output=True, text=True).stdout
+                
+            if 'target_url' in prefs_check:
+                import re
+                match = re.search(r'<string name="target_url">(.*?)</string>', prefs_check)
+                if match:
+                    current_url = match.group(1)
+        except Exception:
+            pass
+        
+        return current_url
+
+    async def send_sms(self, device_id: str, phone_number: str, message: str) -> Dict:
+        """
+        Send an SMS message from a device using ADB
+        
+        Args:
+            device_id: Device ID
+            phone_number: Phone number to send SMS to
+            message: SMS message content
+            
+        Returns:
+            Dictionary with result information
+        """
+        logger.info(f"Sending SMS to {phone_number} from device {device_id}")
+        
+        try:
+            # Escape message for shell command
+            escaped_message = self._escape_shell_string(message)
+            
+            # Method 1: Use Android's built-in SMS manager with root access
+            sms_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'su -c "am broadcast -a android.provider.Telephony.SMS_DELIVER ' +
+                f'-c android.intent.category.DEFAULT ' +
+                f'-e address \'{phone_number}\' ' +
+                f'-e sms_body \'{escaped_message}\'"'
+            ]
+            
+            # Method 2: Use service call method with root access
+            sms_service_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'su -c "service call isms 5 s16 \'{phone_number}\' i32 0 i32 0 s16 \'{escaped_message}\'"'
+            ]
+            
+            # Method 3: Use Android's SmsManager API via a shell script
+            sms_script = f"""
+am startservice --user 0 -n com.android.phone/.PhoneInterfaceManager --ei simId 0 \
+--es callingPackage com.android.shell --es message '{escaped_message}' \
+--es recipients '{phone_number}' --es action sendText
+"""
+            # Write the script to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as script_file:
+                script_path = script_file.name
+                script_file.write(sms_script.encode('utf-8'))
+            
+            # Push the script to the device
+            push_cmd = [
+                'adb', '-s', device_id, 'push',
+                script_path, '/data/local/tmp/send_sms.sh'
+            ]
+            
+            # Make the script executable and run it with root
+            chmod_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'su -c "chmod 755 /data/local/tmp/send_sms.sh"'
+            ]
+            
+            run_script_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'su -c "sh /data/local/tmp/send_sms.sh"'
+            ]
+            
+            # Try all three methods in sequence until one works
+            
+            # First try Method 1
+            logger.info(f"Trying SMS method 1 for device {device_id}")
+            process = await asyncio.create_subprocess_exec(
+                *sms_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            stdout_text = stdout.decode('utf-8', errors='replace')
+            stderr_text = stderr.decode('utf-8', errors='replace')
+            
+            success = process.returncode == 0 and "Broadcast completed" in stdout_text
+            
+            # If Method 1 fails, try Method 2
+            if not success:
+                logger.info(f"SMS method 1 failed, trying method 2 for device {device_id}")
+                
+                process = await asyncio.create_subprocess_exec(
+                    *sms_service_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                stdout, stderr = await process.communicate()
+                stdout_text = stdout.decode('utf-8', errors='replace')
+                stderr_text = stderr.decode('utf-8', errors='replace')
+                
+                success = process.returncode == 0
+            
+            # If Method 2 fails, try Method 3 with the script
+            if not success:
+                logger.info(f"SMS method 2 failed, trying method 3 for device {device_id}")
+                
+                # Push the script
+                push_process = await asyncio.create_subprocess_exec(
+                    *push_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await push_process.communicate()
+                
+                # Make executable
+                chmod_process = await asyncio.create_subprocess_exec(
+                    *chmod_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await chmod_process.communicate()
+                
+                # Run the script
+                process = await asyncio.create_subprocess_exec(
+                    *run_script_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                stdout, stderr = await process.communicate()
+                stdout_text = stdout.decode('utf-8', errors='replace')
+                stderr_text = stderr.decode('utf-8', errors='replace')
+                
+                success = process.returncode == 0
+                
+                # Clean up the temporary file
+                try:
+                    os.unlink(script_path)
+                except:
+                    pass
+            
+            if success:
+                logger.info(f"Successfully sent SMS to {phone_number} from device {device_id}")
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "phone_number": phone_number,
+                    "message": message,
+                    "stdout": stdout_text,
+                    "stderr": stderr_text
+                }
+            else:
+                logger.error(f"Failed to send SMS from device {device_id}: {stderr_text}")
+                return {
+                    "success": False,
+                    "device_id": device_id,
+                    "phone_number": phone_number,
+                    "message": message,
+                    "error": stderr_text,
+                    "stdout": stdout_text
+                }
+                
+        except Exception as e:
+            logger.error(f"Error sending SMS from device {device_id}: {e}")
+            return {
+                "success": False,
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "message": message,
+                "error": str(e)
+            }
+
+    async def send_sms_via_ui(self, device_id: str, phone_number: str, message: str) -> Dict:
+        """
+        Send an SMS message by automating the Messages app UI
+        
+        Args:
+            device_id: Device ID
+            phone_number: Phone number to send SMS to
+            message: SMS message content
+            
+        Returns:
+            Dictionary with result information
+        """
+        logger.info(f"Sending SMS to {phone_number} from device {device_id} via Messages app UI")
+        
+        try:
+            # Find the default SMS app package
+            sms_app_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'pm resolve-activity --components -a android.intent.action.SENDTO'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *sms_app_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            stdout_text = stdout.decode('utf-8', errors='replace')
+            
+            # Parse the output to find the default SMS app
+            sms_app = "com.android.messaging"  # Default fallback
+            sms_activity = ".ui.conversationlist.ConversationListActivity"  # Default fallback
+            
+            for line in stdout_text.splitlines():
+                if "android.intent.action.SENDTO" in line and "/" in line:
+                    parts = line.strip().split('/')
+                    if len(parts) >= 2:
+                        sms_app = parts[0].strip()
+                        sms_activity = parts[1].strip()
+                        break
+            
+            logger.info(f"Using SMS app: {sms_app}/{sms_activity}")
+            
+            # 1. Force stop the SMS app first to ensure a clean start
+            await asyncio.create_subprocess_exec(
+                'adb', '-s', device_id, 'shell', f'am force-stop {sms_app}',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.sleep(1)
+            
+            # 2. Start the SMS app
+            start_app_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'am start -a android.intent.action.SENDTO -d "smsto:{phone_number}" --ez exit_on_sent true'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *start_app_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            await asyncio.sleep(2)  # Wait for app to open
+            
+            # 3. Input the message text using ADB input text command
+            input_text_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'input text "{message}"'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *input_text_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(1)  # Wait a bit after entering text
+            
+            # 4. Press the send button by finding and tapping it
+            # First, let's check if this is a Samsung device with a different UI
+            model_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'getprop ro.product.manufacturer'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *model_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            manufacturer = stdout.decode('utf-8', errors='replace').strip().lower()
+            
+            # Different actions depending on the device manufacturer
+            if "samsung" in manufacturer:
+                # Samsung uses a specific send button
+                send_cmd = [
+                    'adb', '-s', device_id, 'shell',
+                    'input tap 980 1840'  # Approximate location of send button on Samsung devices
+                ]
+            else:
+                # Try to use accessibility to find the send button
+                send_cmd = [
+                    'adb', '-s', device_id, 'shell',
+                    'input keyevent 22 && input keyevent 66'  # Tab to the send button and press it
+                ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *send_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(2)  # Wait for the message to be sent
+            
+            # 5. Check if we need to press the back button to exit (some SMS apps stay open)
+            back_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input keyevent KEYCODE_BACK'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *back_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            
+            # Return success
+            logger.info(f"Successfully sent SMS to {phone_number} from device {device_id} via UI automation")
+            return {
+                "success": True,
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "message": message,
+                "method": "ui_automation"
+            }
+                
+        except Exception as e:
+            logger.error(f"Error sending SMS via Messages app UI: {e}")
+            return {
+                "success": False,
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "message": message,
+                "error": str(e)
+            }
+            
+    async def renew_data_via_ui(self, device_id: str, message: str = "DN", phone_number: str = "950") -> Dict:
+        """
+        Send a data renewal SMS using the Messages app UI
+        
+        Args:
+            device_id: Device ID
+            message: Message to send (default: "DN")
+            phone_number: Phone number to send to (default: "950")
+            
+        Returns:
+            Dictionary with result information
+        """
+        logger.info(f"Sending data renewal SMS ({message}) to {phone_number} from device {device_id}")
+        
+        try:
+            # Directly open the messages app with the specific phone number
+            open_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'am start -a android.intent.action.SENDTO -d "smsto:{phone_number}"'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *open_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(2)  # Wait for the app to open
+            
+            # Clear any existing text
+            clear_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input keyevent KEYCODE_CTRL_LEFT input keyevent KEYCODE_A input keyevent KEYCODE_DEL'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *clear_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(0.5)
+            
+            # Input the message text
+            input_cmd = [
+                'adb', '-s', device_id, 'shell',
+                f'input text "{message}"'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *input_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(1)
+            
+            # Press the send button (position varies by device, so we'll use tab and enter)
+            # First try tab to focus on send button
+            tab_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input keyevent 61'  # Tab key
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *tab_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(0.5)
+            
+            # Press enter to send
+            enter_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input keyevent 66'  # Enter key
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *enter_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(1)
+            
+            # Alternative: try tapping the send button (position may vary by device)
+            tap_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input tap 980 1700'  # Approximate location of send button on many devices
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *tap_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            await asyncio.sleep(1)
+            
+            # Go back to exit the conversation
+            back_cmd = [
+                'adb', '-s', device_id, 'shell',
+                'input keyevent 4'  # Back key
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *back_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            
+            # Return success
+            logger.info(f"Successfully sent data renewal SMS to {phone_number} from device {device_id}")
+            return {
+                "success": True,
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "message": message,
+                "method": "ui_automation"
+            }
+                
+        except Exception as e:
+            logger.error(f"Error sending data renewal SMS via UI: {e}")
+            return {
+                "success": False,
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "message": message,
+                "error": str(e)
+            }
 
 # Create global instance
 adb_controller = AdbController() 
