@@ -47,7 +47,7 @@ public class WebViewRequestManager {
 
     private static final String TAG = "WebViewRequestManager";
     private static final int MAX_REDIRECTS = 10;
-    private static final int PAGE_LOAD_TIMEOUT_MS = 30000; // 30 seconds
+    private static final int PAGE_LOAD_TIMEOUT_MS = 10000; // 30 seconds
     private static final int MAX_WEBVIEW_INSTANCES = 1; // Maximum number of concurrent WebViews
     private static final int MAX_WEBVIEW_LIFETIME_REQUESTS = 1; // Maximum requests before recycling
 
